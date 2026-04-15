@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=61"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "weixin-work"
@@ -9,5 +9,11 @@ description = "Convenient Python client for the WeCom (Weixin Work / 企业微�
 requires-python = ">=3.8"
 dependencies = ["requests>=2.20"]
 
-[tool.setuptools.packages.find]
-include = ["weixin_work*"]
+# Flat layout — the package's __init__.py and modules sit directly at the
+# repo root (next to this file), not in a weixin_work/ subdirectory.  Tell
+# setuptools to map the package name to "." so editable / wheel installs
+# pick up the source.  Without this, packages.find returns an empty list
+# and `pip install` produces a no-op install.
+[tool.setuptools]
+packages = ["weixin_work"]
+package-dir = {"weixin_work" = "."}

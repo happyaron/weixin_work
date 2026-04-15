@@ -9,13 +9,14 @@ Obtain the key from the group chat → "Add Robot" settings page.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import requests
 
-from .exceptions import WebhookError
+from .exceptions import WebhookError, WeixinWorkError
 from .messages import (
     FileMessage,
     ImageMessage,
@@ -27,6 +28,39 @@ from .messages import (
 )
 
 _BASE = "https://qyapi.weixin.qq.com/cgi-bin/webhook"
+
+# Same response-size cap as AppClient — WeCom webhook responses are always
+# small JSON.  Guards against memory exhaustion from a misrouted or
+# hostile endpoint.
+_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+
+HTTPTimeout = Union[float, Tuple[float, float], None]
+
+
+def _read_capped_json(resp: requests.Response) -> dict:
+    """Parse a JSON response with a hard byte cap; see AppClient docstring."""
+    cl = resp.headers.get("Content-Length")
+    if cl is not None:
+        try:
+            announced = int(cl)
+        except ValueError:
+            announced = -1
+        if announced > _MAX_RESPONSE_BYTES:
+            resp.close()
+            raise WeixinWorkError(
+                f"response too large: Content-Length={announced} "
+                f"exceeds cap of {_MAX_RESPONSE_BYTES} bytes"
+            )
+    body = bytearray()
+    for chunk in resp.iter_content(chunk_size=8192):
+        if chunk:
+            body.extend(chunk)
+            if len(body) > _MAX_RESPONSE_BYTES:
+                resp.close()
+                raise WeixinWorkError(
+                    f"response exceeded cap of {_MAX_RESPONSE_BYTES} bytes"
+                )
+    return json.loads(bytes(body))
 
 
 class WebhookClient:
@@ -45,7 +79,7 @@ class WebhookClient:
         self,
         key: Optional[str] = None,
         *,
-        timeout: int = 10,
+        timeout: HTTPTimeout = 10,
         session: Optional[requests.Session] = None,
     ) -> None:
         self.key = key or os.environ.get("WEIXIN_WORK_WEBHOOK_KEY") or ""
@@ -54,8 +88,13 @@ class WebhookClient:
                 "Webhook key is required.  Pass it directly or set the "
                 "WEIXIN_WORK_WEBHOOK_KEY environment variable."
             )
-        self.timeout = timeout
+        self.timeout: HTTPTimeout = timeout
         self._session = session or requests.Session()
+
+    def __repr__(self) -> str:
+        # The webhook key is effectively a bearer credential for the chat
+        # room; suppress it from reprs so it doesn't land in tracebacks.
+        return "WebhookClient(key=***)"
 
     # ------------------------------------------------------------------
     # Low-level helpers
@@ -70,9 +109,10 @@ class WebhookClient:
         return f"{_BASE}/upload_media?key={self.key}&type=file"
 
     def _post(self, payload: dict) -> dict:
-        resp = self._session.post(self._send_url, json=payload, timeout=self.timeout)
+        resp = self._session.post(self._send_url, json=payload,
+                                  timeout=self.timeout, stream=True)
         resp.raise_for_status()
-        data = resp.json()
+        data = _read_capped_json(resp)
         if data.get("errcode", 0) != 0:
             raise WebhookError(
                 f"Webhook send failed: {data}",
@@ -188,9 +228,10 @@ class WebhookClient:
                 self._upload_url,
                 files={"media": (path.name, fh)},
                 timeout=self.timeout,
+                stream=True,
             )
         resp.raise_for_status()
-        data = resp.json()
+        data = _read_capped_json(resp)
         if data.get("errcode", 0) != 0:
             raise WebhookError(
                 f"File upload failed: {data}",

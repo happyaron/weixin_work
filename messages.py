@@ -18,6 +18,12 @@ from typing import List, Optional
 # Text
 # ---------------------------------------------------------------------------
 
+# WeCom's documented cap on plain-text message bodies (in UTF-8 bytes).
+# Exceeding this yields a cryptic server-side errcode with no indication
+# of the actual limit, so we validate locally.
+_TEXT_MESSAGE_MAX_BYTES = 2048
+
+
 @dataclass
 class TextMessage:
     """Plain-text message, optionally @-mentioning users or phones.
@@ -32,6 +38,14 @@ class TextMessage:
     mentioned_mobile_list: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
+        encoded = self.content.encode("utf-8")
+        if len(encoded) > _TEXT_MESSAGE_MAX_BYTES:
+            # Fail locally with an actionable message rather than letting
+            # WeCom reject this with an opaque errcode.
+            raise ValueError(
+                f"TextMessage.content too long: {len(encoded)} bytes "
+                f"(WeCom cap is {_TEXT_MESSAGE_MAX_BYTES} bytes, UTF-8)"
+            )
         payload: dict = {"content": self.content}
         if self.mentioned_list:
             payload["mentioned_list"] = self.mentioned_list
@@ -75,7 +89,14 @@ class ImageMessage:
 
     def to_dict(self) -> dict:
         b64 = base64.b64encode(self.data).decode()
-        md5 = hashlib.md5(self.data).hexdigest()
+        # The WeCom API requires an MD5 here purely for integrity — it's
+        # not a security-sensitive use of the hash.  usedforsecurity=False
+        # (Python 3.9+) lets this work on FIPS-enabled builds that
+        # otherwise reject MD5 entirely.  Fall back for older Pythons.
+        try:
+            md5 = hashlib.md5(self.data, usedforsecurity=False).hexdigest()
+        except TypeError:
+            md5 = hashlib.md5(self.data).hexdigest()
         return {"msgtype": "image", "image": {"base64": b64, "md5": md5}}
 
 

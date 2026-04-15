@@ -69,21 +69,19 @@ def webhook_examples():
 # ============================================================
 
 def app_examples():
-    # Credentials from environment (or pass directly)
+    # Credentials from environment (or pass directly — NEVER hardcode
+    # real corp_secret values in tracked files).
     app = AppClient(
-        #corp_id=os.environ["WEIXIN_WORK_CORP_ID"],
-        #corp_secret=os.environ["WEIXIN_WORK_CORP_SECRET"],
-        #agent_id=int(os.environ["WEIXIN_WORK_AGENT_ID"]),
-        corp_id='<REDACTED_CORP_ID>',
-        corp_secret='<REDACTED_CORP_SECRET>',
-        agent_id=<REDACTED_AGENT_ID>,
+        corp_id=os.environ["WEIXIN_WORK_CORP_ID"],
+        corp_secret=os.environ["WEIXIN_WORK_CORP_SECRET"],
+        agent_id=int(os.environ["WEIXIN_WORK_AGENT_ID"]),
     )
 
     # 1. Broadcast to everyone
-    #app.send_text("Broadcast message!", to_user="@all")
+    app.send_text("Broadcast message!", to_user="@all")
 
     # 2. Target specific users
-    app.send_text("测试信息", to_user="@all")
+    #app.send_text("测试信息", to_user="@all")
 
     # 3. Target a department
     #app.send_markdown(

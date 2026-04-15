@@ -32,6 +32,13 @@ from .messages import (
 
 _BASE = "https://qyapi.weixin.qq.com/cgi-bin"
 
+# WeCom errcodes that signal the access_token in the request URL was no
+# longer valid server-side.  On any of these we invalidate the cached token
+# (compare-and-swap) and retry the request exactly once.
+#   42001 — access_token expired.
+#   40014 — access_token invalid (e.g. revoked mid-flight, wrong corp/app).
+_TOKEN_REFRESH_ERRCODES = frozenset({42001, 40014})
+
 
 class _TokenCache:
     """Thread-safe access-token cache with automatic renewal."""
@@ -58,9 +65,20 @@ class _TokenCache:
             self._expires_at = time.monotonic() + data.get("expires_in", 7200)
             return self._token
 
-    def invalidate(self) -> None:
+    def invalidate(self, failed_token: str) -> None:
+        """Mark the cache as stale, but only if *failed_token* is still the
+        currently-cached value.
+
+        Compare-and-swap prevents a thundering-herd wipe: if two threads both
+        see a 42001 / 40014 for the same expired token, the first refreshes
+        and the second's invalidate() is a no-op (because the cache now holds
+        a fresh token that the second thread just hasn't picked up yet).
+        Without this, the second thread would clear a perfectly good fresh
+        token and trigger another round-trip to gettoken.
+        """
         with self._lock:
-            self._expires_at = 0.0
+            if self._token == failed_token:
+                self._expires_at = 0.0
 
 
 class AppClient:
@@ -110,27 +128,32 @@ class AppClient:
     # ------------------------------------------------------------------
 
     def _post(self, endpoint: str, payload: dict, *, retry: bool = True) -> dict:
-        url = f"{_BASE}/{endpoint}?access_token={self._token()}"
+        token = self._token()
+        url = f"{_BASE}/{endpoint}?access_token={token}"
         resp = self._session.post(url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
         errcode = data.get("errcode", 0)
-        # 42001 = token expired; refresh once and retry
-        if errcode == 42001 and retry:
-            self._token_cache.invalidate()
+        if errcode in _TOKEN_REFRESH_ERRCODES and retry:
+            self._token_cache.invalidate(failed_token=token)
             return self._post(endpoint, payload, retry=False)
         if errcode != 0:
             raise APIError(errcode, data.get("errmsg", ""))
         return data
 
-    def _get(self, endpoint: str, params: Optional[dict] = None) -> dict:
+    def _get(self, endpoint: str, params: Optional[dict] = None, *, retry: bool = True) -> dict:
+        token = self._token()
         url = f"{_BASE}/{endpoint}"
-        p = {"access_token": self._token(), **(params or {})}
+        p = {"access_token": token, **(params or {})}
         resp = self._session.get(url, params=p, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
-        if data.get("errcode", 0) != 0:
-            raise APIError(data["errcode"], data.get("errmsg", ""))
+        errcode = data.get("errcode", 0)
+        if errcode in _TOKEN_REFRESH_ERRCODES and retry:
+            self._token_cache.invalidate(failed_token=token)
+            return self._get(endpoint, params, retry=False)
+        if errcode != 0:
+            raise APIError(errcode, data.get("errmsg", ""))
         return data
 
     # ------------------------------------------------------------------
@@ -209,14 +232,18 @@ class AppClient:
         to_party: Union[str, List[str], None] = None,
         to_tag: Union[str, List[str], None] = None,
         safe: int = 0,
+        enable_duplicate_check: int = 0,
+        duplicate_check_interval: int = 1800,
     ) -> dict:
-        """Send a plain-text message."""
+        """Send a plain-text message.  See ``send()`` for dedup semantics."""
         return self.send(
             TextMessage(content=content),
             to_user=to_user,
             to_party=to_party,
             to_tag=to_tag,
             safe=safe,
+            enable_duplicate_check=enable_duplicate_check,
+            duplicate_check_interval=duplicate_check_interval,
         )
 
     def send_markdown(
@@ -226,13 +253,17 @@ class AppClient:
         to_user: Union[str, List[str], None] = None,
         to_party: Union[str, List[str], None] = None,
         to_tag: Union[str, List[str], None] = None,
+        enable_duplicate_check: int = 0,
+        duplicate_check_interval: int = 1800,
     ) -> dict:
-        """Send a Markdown-formatted message."""
+        """Send a Markdown-formatted message.  See ``send()`` for dedup semantics."""
         return self.send(
             MarkdownMessage(content=content),
             to_user=to_user,
             to_party=to_party,
             to_tag=to_tag,
+            enable_duplicate_check=enable_duplicate_check,
+            duplicate_check_interval=duplicate_check_interval,
         )
 
     def send_image(
@@ -242,13 +273,20 @@ class AppClient:
         to_user: Union[str, List[str], None] = None,
         to_party: Union[str, List[str], None] = None,
         to_tag: Union[str, List[str], None] = None,
+        enable_duplicate_check: int = 0,
+        duplicate_check_interval: int = 1800,
     ) -> dict:
-        """Send an image by its media_id (upload first via upload_media)."""
+        """Send an image by its media_id (upload first via upload_media).
+
+        See ``send()`` for dedup semantics.
+        """
         payload = {
             **self._target(to_user, to_party, to_tag),
             "agentid": self.agent_id,
             "msgtype": "image",
             "image": {"media_id": media_id},
+            "enable_duplicate_check": enable_duplicate_check,
+            "duplicate_check_interval": duplicate_check_interval,
         }
         return self._post("message/send", payload)
 
@@ -259,13 +297,17 @@ class AppClient:
         to_user: Union[str, List[str], None] = None,
         to_party: Union[str, List[str], None] = None,
         to_tag: Union[str, List[str], None] = None,
+        enable_duplicate_check: int = 0,
+        duplicate_check_interval: int = 1800,
     ) -> dict:
-        """Send news article cards."""
+        """Send news article cards.  See ``send()`` for dedup semantics."""
         return self.send(
             NewsMessage(articles=articles),
             to_user=to_user,
             to_party=to_party,
             to_tag=to_tag,
+            enable_duplicate_check=enable_duplicate_check,
+            duplicate_check_interval=duplicate_check_interval,
         )
 
     def send_file(
@@ -275,13 +317,17 @@ class AppClient:
         to_user: Union[str, List[str], None] = None,
         to_party: Union[str, List[str], None] = None,
         to_tag: Union[str, List[str], None] = None,
+        enable_duplicate_check: int = 0,
+        duplicate_check_interval: int = 1800,
     ) -> dict:
-        """Send a file by its media_id."""
+        """Send a file by its media_id.  See ``send()`` for dedup semantics."""
         return self.send(
             FileMessage(media_id=media_id),
             to_user=to_user,
             to_party=to_party,
             to_tag=to_tag,
+            enable_duplicate_check=enable_duplicate_check,
+            duplicate_check_interval=duplicate_check_interval,
         )
 
     # ------------------------------------------------------------------
@@ -303,7 +349,8 @@ class AppClient:
             The ``media_id`` string (valid for 3 days).
         """
         path = Path(path)
-        url = f"{_BASE}/media/upload?access_token={self._token()}&type={media_type}"
+        token = self._token()
+        url = f"{_BASE}/media/upload?access_token={token}&type={media_type}"
         with path.open("rb") as fh:
             resp = self._session.post(
                 url,
@@ -312,6 +359,13 @@ class AppClient:
             )
         resp.raise_for_status()
         data = resp.json()
-        if data.get("errcode", 0) != 0:
-            raise APIError(data["errcode"], data.get("errmsg", ""))
+        errcode = data.get("errcode", 0)
+        if errcode != 0:
+            # No in-call retry: the file stream has already been consumed and
+            # re-seeking isn't always possible (non-regular files).  But CAS
+            # invalidate the token so the caller's next request gets a fresh
+            # one instead of hitting 42001 again.
+            if errcode in _TOKEN_REFRESH_ERRCODES:
+                self._token_cache.invalidate(failed_token=token)
+            raise APIError(errcode, data.get("errmsg", ""))
         return data["media_id"]

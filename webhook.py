@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -28,6 +29,21 @@ from .messages import (
 )
 
 _BASE = "https://qyapi.weixin.qq.com/cgi-bin/webhook"
+
+# Match the ``key=<value>`` query parameter anywhere in a URL-bearing string.
+# The webhook key is effectively the bearer credential for the target chat
+# room; the WeCom API mandates it in the query string, so we can't remove it
+# from outgoing requests — but we can make sure it never appears in raised
+# exception messages (``requests.HTTPError`` stringifies with the full URL by
+# default) or in any log line we emit ourselves.
+_KEY_QUERY_RE = re.compile(r"([?&]key=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def _scrub(text: str) -> str:
+    """Redact the webhook ``key=…`` query param from a URL or error text."""
+    if not text:
+        return text
+    return _KEY_QUERY_RE.sub(r"\1***", text)
 
 # Same response-size cap as AppClient — WeCom webhook responses are always
 # small JSON.  Guards against memory exhaustion from a misrouted or
@@ -109,9 +125,20 @@ class WebhookClient:
         return f"{_BASE}/upload_media?key={self.key}&type=file"
 
     def _post(self, payload: dict) -> dict:
-        resp = self._session.post(self._send_url, json=payload,
-                                  timeout=self.timeout, stream=True)
-        resp.raise_for_status()
+        try:
+            resp = self._session.post(self._send_url, json=payload,
+                                      timeout=self.timeout, stream=True)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            # ``requests`` default str() for HTTPError / ConnectionError /
+            # Timeout embeds the full URL (including key=…) in the message;
+            # re-raise via WebhookError with the key redacted.  ``from None``
+            # suppresses the original exception chain so the URL doesn't
+            # resurface via __cause__ / __context__.
+            raise WebhookError(
+                f"webhook HTTP call failed: {_scrub(str(exc))}",
+                errcode=-1, errmsg="http-error",
+            ) from None
         data = _read_capped_json(resp)
         if data.get("errcode", 0) != 0:
             raise WebhookError(
@@ -223,14 +250,20 @@ class WebhookClient:
             The ``media_id`` string returned by the API.
         """
         path = Path(path)
-        with path.open("rb") as fh:
-            resp = self._session.post(
-                self._upload_url,
-                files={"media": (path.name, fh)},
-                timeout=self.timeout,
-                stream=True,
-            )
-        resp.raise_for_status()
+        try:
+            with path.open("rb") as fh:
+                resp = self._session.post(
+                    self._upload_url,
+                    files={"media": (path.name, fh)},
+                    timeout=self.timeout,
+                    stream=True,
+                )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise WebhookError(
+                f"webhook file upload failed: {_scrub(str(exc))}",
+                errcode=-1, errmsg="http-error",
+            ) from None
         data = _read_capped_json(resp)
         if data.get("errcode", 0) != 0:
             raise WebhookError(
